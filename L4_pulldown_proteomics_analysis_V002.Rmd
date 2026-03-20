@@ -1,0 +1,589 @@
+---
+title: "L4_pulldown_proteomics_analysis_V001"
+output: html_document
+date: "2026-03-14"
+---
+
+
+
+```{r}
+# Load packages
+library(tidyverse)
+library(limma)
+library(DEqMS)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(scales)# for label_scientific() in dotblots
+library(msImpute)#For imputing 
+```
+
+#Import the data 
+Get data from the pre-processed file, where headers for MS1 and MS2 columns have been modified to include 
+only the sample and replicate info and columns indicating nr of detected peptides have been removed.
+```{r}
+data <- read.csv2("/Users/mikelre/Documents/project_05_L4_pulldown_&_Kinetics/L4_Pulldown/L4_pulldown_proteomics/proteomics_raw_data/proteomics_raw_data_preprocessed/CPMSF_GPPF-MRE-280_CF280_proteotypic_protein-pivot_V002.csv", check.names = FALSE, sep = ";")
+```
+
+#Import CrapOme dataframe 
+```{r}
+CrapOme_df <- read.csv2("/Users/mikelre/Documents/project_05_L4_pulldown_&_Kinetics/L4_Pulldown/L4_pulldown_proteomics/CrapOme/CrapOme_protein_list_V001.csv", check.names = FALSE, sep = ";")
+
+CrapOme_df$GENE <- sub("_HUMAN$", "", CrapOme_df$GENE)
+
+```
+
+#PCA QC
+```{r}
+#Generate expression matrix
+quant_cols_PCA <- c(
+"1a_MS2","1b_MS2","1c_MS2",
+"2a_MS2","2b_MS2","2c_MS2",
+"3a_MS2","3b_MS2","3c_MS2",
+"4a_MS2","4b_MS2","4c_MS2"
+)
+
+expr_PCA <- data[, quant_cols_PCA]
+rownames(expr_PCA) <- data$PG.ProteinGroups
+
+#First transform dataframe valiues to numeric:
+# identify MS2 columns
+ms2_cols <- grep("_MS2$", names(expr_PCA), value = TRUE)
+
+# convert to numeric
+expr_PCA[ms2_cols] <- lapply(expr_PCA[ms2_cols],
+                         function(x) as.numeric(as.character(x)))
+
+
+#Log2 transform
+expr_log2_PCA <- log2(expr_PCA)
+
+#Remove proteins with many missing values
+keep <- rowSums(!is.na(expr_log2_PCA)) >= 3 # keep only proteins quantified (non-NA) in ≥x samples
+expr_log2_PCA <- expr_log2_PCA[keep,]
+
+#Inpute missing valuies for PCA only. PCA requires complete data, so temporarily fill missing values.Simple approach: replace NA with column medians.
+#would this be better with row medians?
+
+expr_pca <- expr_log2_PCA
+
+for(i in 1:ncol(expr_pca)){
+  expr_pca[is.na(expr_pca[,i]), i] <- median(expr_pca[,i], na.rm = TRUE)
+}
+
+#Run PCA
+pca_data <- prcomp(t(expr_pca), scale. = TRUE)
+
+# Get sample PC scores (PC coordinates for samples)
+pca_df <- as.data.frame(pca_data$x)  # samples x PCs
+
+#Add metadata to pca_df
+sample_group <- data.frame(sample = quant_cols_PCA, 
+                            group = c("TT+L4", "TT+L4", "TT+L4", 
+                                      "L4", "L4", "L4", 
+                                      "TT+Flag", "TT+Flag", "TT+Flag",
+                                      "Flag", "Flag", "Flag") 
+                            )
+
+pca_df$group <- sample_group$group
+
+
+# Calculate variance explained for labels
+percentVar <- round(100 * (pca_data$sdev^2 / sum(pca_data$sdev^2)))
+
+
+# Create PCA plot
+pca_plot <- ggplot(pca_df, aes(x=PC1, y=PC2, color = group, label = group)) +
+  geom_point(size=3) +
+  geom_text(hjust = 0.5, vjust = -0.9, size = 4) +  # Adds labels above points
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_minimal() +
+  ggtitle("PCA of log2 transformed MS2 intensities") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(pca_plot)
+```
+
+#Extract genes loadings
+```{r}
+# Extract gene loadings (contributions to PCs)
+gene_loadings <- pca_data$rotation  # genes x PCs
+
+#Get top contributing genes to PC1 and PC2. We do this by selecting the top X genes with highest absolute value of loading
+ranked_genes_PC1 <- sort(abs(gene_loadings[, 1]), decreasing = TRUE)
+ranked_genes_PC2 <- sort(abs(gene_loadings[, 2]), decreasing = TRUE)
+
+# Display top 20 gene names contributing to PC1 and PC2
+top_X_genes_PC1 <- names(head(ranked_genes_PC1, 100))
+top_X_genes_PC2 <- names(head(ranked_genes_PC2, 50))
+
+#Write csv files (useful for string analysis )
+write.csv(top_X_genes_PC1, file = "Top_genes_PC1.csv", row.names = FALSE, quote = FALSE)
+write.csv(top_X_genes_PC2, file = "Top_genes_PC2.csv", row.names = FALSE, quote = FALSE)
+
+```
+
+#Extract Quantification matrix
+
+"1a_MS2","1b_MS2","1c_MS2", -> These samples are TT+L4
+"2a_MS2","2b_MS2","2c_MS2", -> These samples are L4
+"3a_MS2","3b_MS2","3c_MS2", -> These samples are TT+Flag
+"4a_MS2","4b_MS2","4c_MS2" -> These samples are Flag
+```{r}
+quant_cols <- c(
+"1a_MS2","1b_MS2","1c_MS2",
+"3a_MS2","3b_MS2","3c_MS2"
+)
+
+expr <- data[,quant_cols]
+
+#Set row names to proteins. We can change this to give gene name!
+rownames(expr) <- data$PG.ProteinGroups
+
+
+```
+
+
+
+#Log2 transformation of the data
+```{r}
+
+#Fairst transform dataframe valiues to numeric:
+# identify MS2 columns
+ms2_cols <- grep("_MS2$", names(expr), value = TRUE)
+
+# convert to numeric
+expr[ms2_cols] <- lapply(expr[ms2_cols],
+                         function(x) as.numeric(as.character(x)))
+
+#Perform Log2 transformation.
+expr_log2 <- log2(expr)
+
+#Check if the median is centered
+boxplot(expr_log2,las=2,main= "Median of samples. Not normalized. Visible test-control effect")
+
+```
+
+## Median centering: 
+Proteomics data from mass spectrometry often shows systematic shifts due to run-to-run variations in instrument performance or sample preparation. Median centering scales each batch or sample so their medians match a common reference (e.g., overall dataset median), minimizing these artifacts without assuming normality
+
+Median normalization aligns the centers of the data distributions. If your pull-down is successful, the test sample will have high-intensity, specific binders that the control lacks. Centering forces the median of the test sample down and the control up, potentially masking true biological differences
+
+The goal of a pull-down experiment is to identify specific binders (present in the test sample) versus non-specific background binders (present in both). Median centering assumes that the majority of proteins remain constant across samples, which is not true in a pull-down where the test sample is intentionally highly enriched for specific proteins. So, It is not appropiate to do median centering in thios case!
+
+Common aproach we can follow: Subtract the intensity of proteins in the control from the test sample to determine specific binders
+
+
+
+
+#Cleaning step 
+Fom test samples, remove all proteins that have NaN value in 2 or 3 replicates (in test sample)
+```{r}
+test_cols <- c("1a_MS2","1b_MS2","1c_MS2")
+
+keep <- rowSums(!is.na(expr_log2[,test_cols])) >= 3 # keep only proteins quantified (non-NA) in ≥x samples. If I select 3, I do not allow any missing value in the test samples. Increase the confidence of detection and reduce the noise!
+
+expr_log2 <- expr_log2[keep,]
+data <- data[keep,]
+```
+
+#QC of Log2 transformation with 
+```{r}
+#Calculate the average intensity of the true interactors
+# Columns to use
+cols <- c("1a_MS2", "1b_MS2", "1c_MS2")
+
+# Create summary dataframe with averaged intensityes
+expr_log2_average_intensity <- data.frame(
+  Mean_MS2 = rowMeans(true_interactors[, cols], na.rm = TRUE),
+  SD_MS2 = apply(true_interactors[, cols], 1, sd, na.rm = TRUE)
+)
+```
+
+
+#Taking the true positives 
+```{r}
+# Define columns (you already have this)
+bait_cols <- grep("^1[abc]_MS2$", colnames(expr_log2), value = TRUE)
+control_cols <- grep("^3[abc]_MS2$", colnames(expr_log2), value = TRUE)
+
+# Condition 1: present in ALL bait samples
+present_in_bait <- rowSums(!is.na(expr_log2[, bait_cols])) == length(bait_cols)#Keep proteins detected in all bait samples
+
+# Condition 2: missing in ALL control samples
+missing_in_control <- rowSums(!is.na(expr_log2[, control_cols])) == 0 #Keep proteins detected in all bait samples
+
+# Combine conditions
+true_interactors <- expr_log2[present_in_bait & missing_in_control, ]
+#Transform protein names to gene names using the data df
+rownames(true_interactors) <- data$PG.Genes[match(rownames(true_interactors), data$PG.ProteinGroups)]
+
+
+#Calculate the average intensity of the true interactors
+# Columns to use
+cols <- c("1a_MS2", "1b_MS2", "1c_MS2")
+
+# Create summary dataframe with averaged intensityes
+true_interactors_average_intensity <- data.frame(
+  Mean_MS2 = rowMeans(true_interactors[, cols], na.rm = TRUE),
+  SD_MS2 = apply(true_interactors[, cols], 1, sd, na.rm = TRUE)
+)
+
+#sort the dataframe to get highest MS2 intensities oin top
+true_interactors_average_intensity <- true_interactors_average_intensity %>%
+  arrange(desc(Mean_MS2))
+
+#Clean the list with CrapOme database
+true_interactors_average_intensity_filtered <- true_interactors_average_intensity[
+  !rownames(true_interactors_average_intensity) %in% CrapOme_df$GENE, 
+]
+
+#sort the dataframe to get highest MS2 intensities oin top
+true_interactors_average_intensity_filtered <- true_interactors_average_intensity_filtered %>%
+  arrange(desc(Mean_MS2))
+
+hist(true_interactors_average_intensity_filtered$Mean_MS2,
+     main = "Distribution of Mean MS2 Intensities",
+     xlab = "Mean MS2 Intensity",
+     ylab = "Frequency")
+
+write.csv(as.data.frame(true_interactors_average_intensity_filtered), "true_interactors_average_intensity_filtered_TTL4vsTTFLAG.csv", row.names = TRUE)
+
+#check which genes were filtered out
+contaminants_in_true_interactors <- true_interactors_average_intensity[
+  rownames(true_interactors_average_intensity) %in% CrapOme_df$GENE, 
+]
+
+```
+
+
+
+#Define experimental design
+```{r}
+group <- factor(c(
+"Test","Test","Test",
+"Control","Control","Control"
+))
+
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+```
+
+
+#Fit Limma model 
+```{r}
+fit <- lmFit(expr_log2, design)
+
+#Introduce comparissons
+contrast <- makeContrasts(Test-Control, levels=design)
+
+fit2 <- contrasts.fit(fit, contrast)
+fit2 <- eBayes(fit2)
+
+```
+
+
+#Prepare DEqMS Peptide Counts
+DEqMS needs number of quantified peptides per protein. For this we use:
+PG.NrOfPrecursorsIdentified_Experiment_wide_ -> Column in excel file (headers modified)
+
+```{r}
+pepcount <- data$PG.NrOfPrecursorsIdentified_Experiment_wide_
+names(pepcount) <- rownames(expr_log2)
+fit2$count <- pepcount
+
+#QC: If this returns FALSE, the counts are not aligned with the proteins.
+all(rownames(expr_log2) == names(pepcount))
+#QC: All the values resulting below shold be equal
+nrow(expr_log2)
+length(pepcount)
+length(fit2$count)
+```
+
+
+#Run DEqMS
+```{r}
+#Run DEqMS
+fit3 <- spectraCounteBayes(fit2)
+
+#Extract DEqMS resuls
+results <- outputResult(fit3)
+```
+
+
+#Merge Protein Metadata
+```{r}
+results$Protein <- rownames(results)
+
+results <- left_join(results,
+                     data[,c("PG.ProteinGroups","PG.Genes","PG.ProteinDescriptions")],
+                     by=c("Protein"="PG.ProteinGroups"))
+```
+
+
+
+#QC that the Limma model worked
+```{r}
+VarianceScatterplot(fit3)
+VarianceBoxplot(fit3)
+```
+
+The red line is slightly higher at intermediate counts and then gently slopes down at higher counts; importantly, it is smooth and not wildly oscillating, and variance clearly does not explode at high counts. That’s perfectly acceptable: DEqMS has captured the modest dependence of variance on evidence count, and will now assign smaller P‑values to proteins with more evidence at the same fold‑change.
+
+I would be concerned only if:
+
+The red line were extremely wiggly (overfitting),
+
+Or strongly increasing with counts (suggesting a modeling issue),
+
+Or based on very few distinct count values (e.g. you accidentally passed a constant count vector).
+
+
+#Downstream Analysis 
+
+##Volcano plot
+```{r}
+adj.P.Val_value <- 0.001
+logFC_value <- 2.5
+
+results <- results %>%
+  mutate(significance = case_when(
+    adj.P.Val < adj.P.Val_value & logFC > logFC_value  ~ "Upregulated",
+    adj.P.Val < adj.P.Val_value & logFC < -logFC_value ~ "Downregulated",
+    TRUE ~ "Not significant"
+  ))
+
+ggplot(results, aes(logFC, -log10(adj.P.Val), color = significance)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_vline(xintercept = c(-logFC_value, logFC_value), linetype = "dashed") +
+  geom_hline(yintercept = -log10(adj.P.Val_value), linetype = "dashed") +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey70")) +  
+  geom_text_repel(data = subset(results, abs(logFC) > 5 & -log10(adj.P.Val) > 3),
+                  aes(label = PG.Genes),  # Remove redundant x/y/color from aes()
+                  color = "black",
+                  max.overlaps = 15, size = 3) +
+  theme_minimal() +
+  ggtitle("TT+L4 vs TT") +
+  labs(color = "Category")
+
+```
+
+#Extract upregulated and downregulated genes
+```{r}
+up_genes <- results$PG.Genes[results$sig == "Upregulated"] 
+lapply(up_genes, function(x) x[!is.na(x)])
+length(up_genes)
+
+down_genes <- results$PG.Genes[results$sig == "Downregulated"]
+length(down_genes)
+```
+
+
+#Filter results to remove genes in CrapOme database
+```{r}
+# Remove rows from df1 where 'gene' column matches ANY value in df2$gene
+results_filtered <- results[!results$PG.Genes %in% CrapOme_df$GENE, ]
+
+nrow(results)
+nrow(results_filtered)
+```
+
+#Volcano plot after filtering
+```{r}
+adj.P.Val_value <- 0.001
+logFC_value <- 2.5
+
+results_filtered <- results_filtered %>%
+  mutate(significance = case_when(
+    adj.P.Val < adj.P.Val_value & logFC > logFC_value  ~ "Upregulated",
+    adj.P.Val < adj.P.Val_value & logFC < -logFC_value ~ "Downregulated",
+    TRUE ~ "Not significant"
+  ))
+
+ggplot(results_filtered, aes(logFC, -log10(adj.P.Val), color = significance)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_vline(xintercept = c(-logFC_value, logFC_value), linetype = "dashed") +
+  geom_hline(yintercept = -log10(adj.P.Val_value), linetype = "dashed") +
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not significant" = "grey70")) +  
+  geom_text_repel(data = subset(results_filtered, abs(logFC) > 5 & -log10(adj.P.Val) > 3),
+                  aes(label = PG.Genes),  # Remove redundant x/y/color from aes()
+                  color = "black",
+                  max.overlaps = 15, size = 3) +
+  #coord_cartesian(ylim = c(0, 10)) +   # Changing Y axis limmits
+  theme_minimal() +
+  ggtitle("TT+L4 vs TT. Filtered with CrapOme") +
+  labs(color = "Category")
+
+```
+
+
+#Extract results of up and downregulated proteins
+```{r}
+
+up_genes_post_filtration <- results_filtered$PG.Genes[results_filtered$sig == "Upregulated"] 
+lapply(up_genes_post_filtration, function(x) x[!is.na(x)]) #For each element in the list, remove all NA values
+length(up_genes_post_filtration)
+
+#Write a csv file 
+write.csv(as.data.frame(up_genes_post_filtration), "Up_genes_post_filtration_TTL4vsTT.csv", row.names = TRUE)
+
+down_genes_post_filtration <- results_filtered$PG.Genes[results_filtered$sig == "Downregulated"]
+lapply(down_genes_post_filtration, function(x) x[!is.na(x)]) #For each element in the list, remove all NA values
+length(down_genes_post_filtration)
+
+#Write a csv file 
+write.csv(as.data.frame(down_genes_post_filtration), "Down_genes_post_filtration_TTL4vsTT.csv", row.names = TRUE)
+
+```
+
+
+
+
+
+
+#Venn diagrams.
+```{r}
+
+# Sample data (replace with your actual vectors)
+v1 <- top_X_genes_PC1
+v2 <- top_X_genes_PC2
+#v3 <- pseudogenes
+#v3 <- KEGG_pathway_contributing_genes2
+
+vec_list <- list(v1, v2)
+
+venn_plot <- ggVennDiagram(
+  vec_list,
+  category.names = c("PC1", "PC2")
+) +
+  scale_fill_gradient(low = "#E0F7FA", high = "#FFCDD2") +
+  theme_void() +
+  labs(title = "Comparison of Gene Sets") +
+  theme(
+    text = element_text(family = "sans", size = 14, face = "bold"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),  # centered title
+    plot.margin = margin(10, 10, 10, 10),   # more margin so labels aren’t cut
+    legend.position = "none"   
+  ) +
+  coord_equal() +  # keep circles round
+  scale_x_continuous(expand = expansion(mult = 0.3)) +  # add space left/right
+  scale_y_continuous(expand = expansion(mult = 0.2))    # add space top/bottom
+
+
+# Display
+venn_plot
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Gene ontology analysis
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+#The GO is organized in three aspects: Molecular Function (MF), Cellular Component (CC), and Biological Process (BP)
+      ontology_term <- "BP" #Change gere which ontology term I want to use for the analysis
+
+enrichGO(gene = up_genes_post_filtration, OrgDb = org.Hs.eg.db, ont = ontology_term, keyType = "SYMBOL")
+
+
+# genes_in_clusterX contains gene symbols
+gene_symbols <- as.character(up_genes_post_filtration)
+
+# Convert to Entrez IDs using org.Hs.eg.db
+gene_entrez <- bitr(gene_symbols, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+print(dim(gene_entrez))
+# Print the first few mapped genes
+head(gene_entrez)
+
+# GO enrichment without log2FC
+go_results <- enrichGO(gene = gene_entrez$ENTREZID,  #Entrez IDs
+                       OrgDb = org.Hs.eg.db,  # Specify the organism database
+                       keyType = "ENTREZID",  # Specify key type
+                       ont = ontology_term,  # Choose ontology: "BP" (Biological Process), "CC" (Cellular Component), or "MF" (Molecular Function)
+                       pvalueCutoff = 0.05,  # Adjust p-value cutoff
+                       qvalueCutoff = 0.05)  # Adjust q-value cutoff
+
+# View results
+(as.data.frame(go_results))
+
+# Convert GO enrichment results to data frame
+go_df <- as.data.frame(go_results)
+
+# Save to CSV
+#write.csv(go_df, file = "/Users/mikelre/Documents/project_01_processing_rna/nf_core/results_salmon_human_and_Virus/go_enrichment_results.csv", row.names = FALSE)
+
+
+##Create a dot blot with GO analysis results
+
+# X-axis: Gene ratio (by default)
+# GeneRatio = (genes from my list in the term) ÷ (total genes submitted).
+# It answers: “What proportion of my interesting genes are annotated with this GO term?”
+# Y-axis: GO terms
+# Dot size: Number of genes
+# Dot color: Adjusted p-value (FDR)
+
+#Number of ontologies to plot;Generate dot plot (top X categories)
+number_ontologies_toplot <- 5
+
+#recent enrichplot versions (≥1.18), the argument orderBy = "Count" is actually ignored if x = "GeneRatio" is set (default). Therefore we have to subset and reorder the results dataframe manually:
+
+# take top N pathways by Count
+top_df <- go_df %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = number_ontologies_toplot)
+
+# make Description ordered by Count (so y-axis respects it)
+top_df$Description <- fct_reorder(top_df$Description, top_df$Count)
+
+# rebuild an enrichResult-like object for plotting
+go_results@result <- top_df
+
+p <- dotplot(go_results, showCategory = number_ontologies_toplot, x = "GeneRatio") +
+  scale_fill_continuous(labels = label_scientific(), low = "navy", high = "lightblue") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 10, face = "bold", hjust = 0.5),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 13)
+  ) +
+  labs(
+    x = "Gene Ratio",
+    y = "",
+    title = 
+    #title = sprintf("Cluster %s/%s - Top %s enriched GO-%s Pathways", cluster_nr, number_of_clusters, number_ontologies_toplot, ontology_term)
+  )
+
+
+# Print plot
+print(p)
+
+```
+
